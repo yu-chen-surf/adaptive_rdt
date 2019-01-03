@@ -996,6 +996,8 @@ struct task_struct {
 #ifdef CONFIG_INTEL_RDT
 	u32				closid;
 	u32				rmid;
+	struct rdtgroup                 *grp;
+	struct list_head		rdtgrp_list;
 #endif
 #ifdef CONFIG_FUTEX
 	struct robust_list_head __user	*robust_list;

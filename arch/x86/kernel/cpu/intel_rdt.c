@@ -459,19 +459,27 @@ static int domain_setup_ctrlval(struct rdt_resource *r, struct rdt_domain *d)
 {
 	struct msr_param m;
 	u32 *dc, *dm;
+	struct rdt_res_seg	**segs;
 
-	dc = kmalloc_array(r->num_closid, sizeof(*d->ctrl_val), GFP_KERNEL);
+	dc = kcalloc(r->num_closid, sizeof(*d->ctrl_val), GFP_KERNEL);
 	if (!dc)
 		return -ENOMEM;
 
-	dm = kmalloc_array(r->num_closid, sizeof(*d->mbps_val), GFP_KERNEL);
+	dm = kcalloc(r->num_closid, sizeof(*d->mbps_val), GFP_KERNEL);
 	if (!dm) {
 		kfree(dc);
 		return -ENOMEM;
 	}
 
+	segs = kcalloc(r->num_closid, sizeof(struct rdt_res_seg*), GFP_KERNEL);
+	if (!segs)
+		return -ENOMEM;
+
 	d->ctrl_val = dc;
 	d->mbps_val = dm;
+	d->segs = segs;
+	INIT_LIST_HEAD(&d->act_seg_list);
+	INIT_LIST_HEAD(&d->inact_seg_list);
 	setup_default_ctrlval(r, dc, dm);
 
 	m.low = 0;
@@ -617,6 +625,7 @@ static void domain_remove_cpu(int cpu, struct rdt_resource *r)
 
 		kfree(d->ctrl_val);
 		kfree(d->mbps_val);
+		kfree(d->segs);
 		bitmap_free(d->rmid_busy_llc);
 		kfree(d->mbm_total);
 		kfree(d->mbm_local);

@@ -5,6 +5,9 @@
 #include <linux/sched.h>
 #include <linux/kernfs.h>
 #include <linux/jump_label.h>
+#include <linux/task_work.h>
+#include <linux/kthread.h>
+#include <linux/irq_work.h>
 
 #define IA32_L3_QOS_CFG		0xc81
 #define IA32_L2_QOS_CFG		0xc82
@@ -32,6 +35,8 @@
 
 #define RMID_VAL_ERROR			BIT_ULL(63)
 #define RMID_VAL_UNAVAIL		BIT_ULL(62)
+
+#define INACT_CHECK_INTERVAL_MS	1000
 
 DECLARE_STATIC_KEY_FALSE(rdt_enable_key);
 
@@ -185,10 +190,27 @@ struct rdtgroup {
 	struct mongroup			mon;
 	enum rdtgrp_mode		mode;
 	struct pseudo_lock_region	*plr;
+	struct			irq_work irq_work;
+	struct			kthread_work active_work;
+	struct			kthread_work inactive_work;
+	struct			kthread_worker worker_act;
+	struct			kthread_worker worker_inact;
+	struct task_struct				*thread_act;
+	struct task_struct				*thread_inact;
+	u32				act_decay;
+	struct hrtimer          decay_timer;
+	struct list_head		tasks_list;
+	struct mutex			lock;
+	int						adaptive;
+	int						decay;
+	int						interv;
 };
 
 /* rdtgroup.flags */
 #define	RDT_DELETED		1
+#define	RDT_ACTIVE		2
+
+#define RDTGROUP_DECAY	5
 
 /* rftype.flags */
 #define RFTYPE_FLAGS_CPUS_LIST	1
@@ -300,12 +322,45 @@ struct rdt_domain {
 	int				mbm_work_cpu;
 	int				cqm_work_cpu;
 	u32				*ctrl_val;
+	struct rdt_res_seg		**segs;
 	u32				*mbps_val;
 	u32				new_ctrl;
 	bool				have_new_ctrl;
 	struct pseudo_lock_region	*plr;
+	struct list_head		act_seg_list;
+	struct list_head		inact_seg_list;
 };
 
+struct rdt_res_seg {
+	unsigned int start, end;
+	unsigned int ori_start, ori_end;
+	struct rdt_domain   *dom;
+	int					closid;
+	/* either on sorted active or inactive list */
+	struct list_head	list;
+};
+
+#define RDTSEG_NOW	(1UL<<0)
+#define RDTSEG_ORI	(1UL<<1)
+
+struct rdt_res_seg* find_seg(unsigned int start,
+			struct rdt_domain *domain,
+			int active);
+int insert_seg(struct rdt_res_seg *seg,
+		struct rdt_domain *dom, int active);
+int adjust_seg(struct rdt_res_seg *seg,
+		unsigned int start,
+		unsigned int end,
+		struct rdt_domain *dom,
+		int active);
+int set_seg_from_ctrl(u32 *ctrl,
+			struct rdt_res_seg *seg,
+			struct rdt_resource *r,
+			int mode);
+int set_ctrl_from_seg(u32 *ctrl,
+			struct rdt_res_seg *seg,
+			struct rdt_resource *r,
+			int mode);
 /**
  * struct msr_param - set a range of MSRs from a domain
  * @res:       The resource to use

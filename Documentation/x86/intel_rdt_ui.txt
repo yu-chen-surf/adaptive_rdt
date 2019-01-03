@@ -1116,3 +1116,32 @@ View the llc occupancy snapshot
 
 # cat /sys/fs/resctrl/p1/mon_data/mon_L3_00/llc_occupancy
 11234000
+
+Adaptive CAT allocation
+-----------------------
+
+Group has cache resource might be inactive during
+non-peak hour, which causes the resource waste
+because active group could not use the resource
+not actively occupied by inactive groups. An adaptive
+strategy must be designed to deal with this problem.
+
+A linked list is used to track the resource regions.
+Within every domain, the resource occupied by group
+are sorted by their start address. To facilitate the
+process, among the rdtgroup, rdt_domain, closid, rdt_res_seq
+either three elements should be addressed if one element
+is given.
+
+The scenario includes:
+1. if a group becomes inactive, its resource must be reclaimed
+   in a deferred manner:
+   if this resource is intersect with other adjacent resource,
+   assign adjacent resource to include this released resource.
+2. if a group becomes active, its resource must be re-allocated again,
+   the new resource range is used as the key to compare with other
+   groups, and find any intersect resources in the list. For every
+   intersect resources, reset their resource to the original ranges.
+   Later a deferred thread should be able to perform similar actions
+   to step 1, AKA, the resource from adjacent inactive group should be
+   merged.

@@ -78,8 +78,12 @@ static void __intel_rdt_sched_in(void)
 	}
 }
 
+void rdt_update(struct task_struct *tsk);
+
 static inline void intel_rdt_sched_in(void)
 {
+	rdt_update(current);
+
 	if (static_branch_likely(&rdt_enable_key))
 		__intel_rdt_sched_in();
 }

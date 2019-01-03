@@ -238,11 +238,73 @@ next:
 	return -EINVAL;
 }
 
+static void bit_set(char *src, int start, int end)
+{
+	int i = start;
+	for (; i <= end; i++)
+		*src |= (1UL << i);
+}
+
+int set_ctrl_from_seg(u32 *ctrl,
+			struct rdt_res_seg *seg,
+			struct rdt_resource *r,
+			int mode)
+{
+	int start, end;
+
+	if (mode & RDTSEG_ORI) {
+		start = seg->ori_start;
+		end = seg->ori_end;
+	} else if (mode & RDTSEG_NOW) {
+		start = seg->start;
+		end = seg->end;
+	} else
+		return -EINVAL;
+
+	if (end - start + 1 > r->cache.cbm_len)
+		return -EINVAL;
+
+	bit_set((char *)ctrl, start, end);
+
+	return 0;
+}
+
+int set_seg_from_ctrl(u32 *ctrl,
+			struct rdt_res_seg *seg,
+			struct rdt_resource *r,
+			int mode)
+{
+	unsigned int start, end, cbm_len;
+
+	cbm_len = r->cache.cbm_len;
+
+	start =
+		find_first_bit((unsigned long*)ctrl, cbm_len);
+	if (start >= cbm_len)
+			return -EINVAL;
+	end =
+		find_next_zero_bit((unsigned long*)ctrl,
+					cbm_len, start) - 1;
+
+	if (mode & RDTSEG_ORI) {
+		seg->ori_start = start;
+		seg->ori_end = end;
+	}
+
+	if (mode & RDTSEG_NOW) {
+		seg->start = start;
+		seg->end = end;
+	}
+
+	return 0;
+}
+
 int update_domains(struct rdt_resource *r, int closid)
 {
 	struct msr_param msr_param;
 	cpumask_var_t cpu_mask;
 	struct rdt_domain *d;
+	struct rdt_res_seg **segs, *new_seg;
 	bool mba_sc;
 	u32 *dc;
 	int cpu;
@@ -257,9 +319,24 @@ int update_domains(struct rdt_resource *r, int closid)
 	mba_sc = is_mba_sc(r);
 	list_for_each_entry(d, &r->domains, list) {
 		dc = !mba_sc ? d->ctrl_val : d->mbps_val;
+		segs = d->segs;
 		if (d->have_new_ctrl && d->new_ctrl != dc[closid]) {
 			cpumask_set_cpu(cpumask_any(&d->cpu_mask), cpu_mask);
 			dc[closid] = d->new_ctrl;
+			new_seg = segs[closid];
+			if (!new_seg) {
+				new_seg = kzalloc(sizeof(struct rdt_res_seg),
+						GFP_KERNEL);
+				if (!new_seg) {
+					pr_err("Could't allocate segment for group %d\n", closid);
+					return -ENOMEM;
+				}
+				new_seg->closid = closid;
+				segs[closid] = new_seg;
+			}
+			set_seg_from_ctrl(&d->new_ctrl,
+					new_seg, r, RDTSEG_NOW | RDTSEG_ORI);
+			insert_seg(new_seg, d, 1);
 		}
 	}
 
@@ -375,6 +452,7 @@ static void show_doms(struct seq_file *s, struct rdt_resource *r, int closid)
 	struct rdt_domain *dom;
 	bool sep = false;
 	u32 ctrl_val;
+	struct rdt_res_seg *seg;
 
 	seq_printf(s, "%*s:", max_name_width, r->name);
 	list_for_each_entry(dom, &r->domains, list) {
@@ -385,6 +463,23 @@ static void show_doms(struct seq_file *s, struct rdt_resource *r, int closid)
 			    dom->mbps_val[closid]);
 		seq_printf(s, r->format_str, dom->id, max_data_width,
 			   ctrl_val);
+		seg = dom->segs[closid];
+		/* It is possible seg has not been assigned schemata yet. */
+		if (seg) {
+			u32 ctrl_now, ctrl_ori;
+
+			pr_debug("group(%d) resource (%d,%d).\n",
+						closid,
+						seg->start,
+						seg->end);
+			if (!set_ctrl_from_seg(&ctrl_now, seg, r, RDTSEG_NOW) &&
+				!set_ctrl_from_seg(&ctrl_ori, seg, r, RDTSEG_ORI)) {
+				seq_puts(s, " ");
+				seq_printf(s, "%x %x",
+					ctrl_now,
+					ctrl_ori);
+			}
+		}
 		sep = true;
 	}
 	seq_puts(s, "\n");

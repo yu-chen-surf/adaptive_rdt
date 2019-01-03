@@ -31,7 +31,6 @@
 #include <linux/sched/signal.h>
 #include <linux/sched/task.h>
 #include <linux/slab.h>
-#include <linux/task_work.h>
 
 #include <uapi/linux/magic.h>
 
@@ -565,6 +564,7 @@ static int __rdtgroup_move_task(struct task_struct *tsk,
 	 * callback has been invoked.
 	 */
 	atomic_inc(&rdtgrp->waitcount);
+	mutex_lock(&rdtgrp->lock);
 	ret = task_work_add(tsk, &callback->work, true);
 	if (ret) {
 		/*
@@ -584,6 +584,8 @@ static int __rdtgroup_move_task(struct task_struct *tsk,
 		if (rdtgrp->type == RDTCTRL_GROUP) {
 			tsk->closid = rdtgrp->closid;
 			tsk->rmid = rdtgrp->mon.rmid;
+			tsk->grp = rdtgrp;
+			list_add_tail(&tsk->rdtgrp_list, &rdtgrp->tasks_list);
 		} else if (rdtgrp->type == RDTMON_GROUP) {
 			if (rdtgrp->mon.parent->closid == tsk->closid) {
 				tsk->rmid = rdtgrp->mon.rmid;
@@ -593,6 +595,7 @@ static int __rdtgroup_move_task(struct task_struct *tsk,
 			}
 		}
 	}
+	mutex_unlock(&rdtgrp->lock);
 	return ret;
 }
 
@@ -1347,6 +1350,182 @@ out:
 	return ret;
 }
 
+static int adaptive_enable(struct rdtgroup *grp, int enable)
+{
+	if (enable) {
+		wake_up_process(grp->thread_act);
+		wake_up_process(grp->thread_inact);
+		hrtimer_start(&grp->decay_timer, ktime_set(0,
+						grp->interv),
+						HRTIMER_MODE_REL);
+	} else {
+		/*TBD*/
+	}
+
+	return 0;
+}
+
+static ssize_t rdtgroup_adaptive_write(struct kernfs_open_file *of,
+				   char *buf, size_t nbytes, loff_t off)
+{
+	struct rdtgroup *rdtgrp;
+	int ret = 0;
+
+	/* Valid input requires a trailing newline */
+	if (nbytes == 0 || buf[nbytes - 1] != '\n')
+		return -EINVAL;
+	buf[nbytes - 1] = '\0';
+
+	rdtgrp = rdtgroup_kn_lock_live(of->kn);
+	if (!rdtgrp) {
+		rdtgroup_kn_unlock(of->kn);
+		return -ENOENT;
+	}
+
+	rdt_last_cmd_clear();
+
+	if (!strcmp(buf, "enabled")) {
+		rdtgrp->adaptive = 1;
+		adaptive_enable(rdtgrp, 1);
+	} else if (!strcmp(buf, "disabled")) {
+		rdtgrp->adaptive = 0;
+		adaptive_enable(rdtgrp, 0);
+	} else {
+		rdt_last_cmd_printf("unknown/unsupported adaptive mode, choose enabled or disabled.\n");
+		ret = -EINVAL;
+	}
+
+	rdtgroup_kn_unlock(of->kn);
+	return ret ?: nbytes;
+}
+
+static int rdtgroup_adaptive_show(struct kernfs_open_file *of,
+			      struct seq_file *s, void *v)
+{
+	struct rdtgroup *rdtgrp;
+
+	rdtgrp = rdtgroup_kn_lock_live(of->kn);
+	if (!rdtgrp) {
+		rdtgroup_kn_unlock(of->kn);
+		return -ENOENT;
+	}
+
+	seq_printf(s, "%s\n", rdtgrp->adaptive ? "enabled" :
+			"disabled");
+
+	rdtgroup_kn_unlock(of->kn);
+	return 0;
+}
+
+static int rdtgroup_active_show(struct kernfs_open_file *of,
+			      struct seq_file *s, void *v)
+{
+	struct rdtgroup *rdtgrp;
+
+	rdtgrp = rdtgroup_kn_lock_live(of->kn);
+	if (!rdtgrp) {
+		rdtgroup_kn_unlock(of->kn);
+		return -ENOENT;
+	}
+
+	seq_printf(s, "%s\n", (rdtgrp->flags & RDT_ACTIVE) ? "active" :
+			"inactive");
+
+	rdtgroup_kn_unlock(of->kn);
+	return 0;
+}
+
+static ssize_t rdtgroup_adaptive_interv_write(struct kernfs_open_file *of,
+				   char *buf, size_t nbytes, loff_t off)
+{
+	struct rdtgroup *rdtgrp;
+	int interv;
+
+	/* Valid input requires a trailing newline */
+	if (nbytes == 0 || buf[nbytes - 1] != '\n')
+		return -EINVAL;
+	buf[nbytes - 1] = '\0';
+
+	if (kstrtoint(strstrip(buf), 0, &interv) || interv < 0)
+		return -EINVAL;
+
+	rdtgrp = rdtgroup_kn_lock_live(of->kn);
+	if (!rdtgrp) {
+		rdtgroup_kn_unlock(of->kn);
+		return -ENOENT;
+	}
+
+	rdt_last_cmd_clear();
+
+	rdtgrp->interv = interv;
+
+	rdtgroup_kn_unlock(of->kn);
+	return nbytes;
+}
+
+static int rdtgroup_adaptive_interv_show(struct kernfs_open_file *of,
+			      struct seq_file *s, void *v)
+{
+	struct rdtgroup *rdtgrp;
+
+	rdtgrp = rdtgroup_kn_lock_live(of->kn);
+	if (!rdtgrp) {
+		rdtgroup_kn_unlock(of->kn);
+		return -ENOENT;
+	}
+
+	seq_printf(s, "%d\n", rdtgrp->interv);
+
+	rdtgroup_kn_unlock(of->kn);
+	return 0;
+}
+
+static ssize_t rdtgroup_adaptive_decay_write(struct kernfs_open_file *of,
+				   char *buf, size_t nbytes, loff_t off)
+{
+	struct rdtgroup *rdtgrp;
+	int decay;
+
+	/* Valid input requires a trailing newline */
+	if (nbytes == 0 || buf[nbytes - 1] != '\n')
+		return -EINVAL;
+	buf[nbytes - 1] = '\0';
+
+	if (kstrtoint(strstrip(buf), 0, &decay) || decay < 0)
+		return -EINVAL;
+
+	rdtgrp = rdtgroup_kn_lock_live(of->kn);
+	if (!rdtgrp) {
+		rdtgroup_kn_unlock(of->kn);
+		return -ENOENT;
+	}
+
+	rdt_last_cmd_clear();
+
+	rdtgrp->decay = decay;
+
+	rdtgroup_kn_unlock(of->kn);
+	return nbytes;
+}
+
+static int rdtgroup_adaptive_decay_show(struct kernfs_open_file *of,
+			      struct seq_file *s, void *v)
+{
+	struct rdtgroup *rdtgrp;
+
+	rdtgrp = rdtgroup_kn_lock_live(of->kn);
+	if (!rdtgrp) {
+		rdtgroup_kn_unlock(of->kn);
+		return -ENOENT;
+	}
+
+	seq_printf(s, "%d\n", rdtgrp->decay);
+
+	rdtgroup_kn_unlock(of->kn);
+
+	return 0;
+}
+
 /* rdtgroup information files for one cache resource. */
 static struct rftype res_common_files[] = {
 	{
@@ -1482,7 +1661,37 @@ static struct rftype res_common_files[] = {
 		.seq_show	= rdtgroup_size_show,
 		.fflags		= RF_CTRL_BASE,
 	},
-
+	{
+		.name		= "adaptive",
+		.mode		= 0644,
+		.kf_ops		= &rdtgroup_kf_single_ops,
+		.write		= rdtgroup_adaptive_write,
+		.seq_show	= rdtgroup_adaptive_show,
+		.fflags		= RF_CTRL_BASE,
+	},
+	{
+		.name		= "active",
+		.mode		= 0444,
+		.kf_ops		= &rdtgroup_kf_single_ops,
+		.seq_show	= rdtgroup_active_show,
+		.fflags		= RF_CTRL_BASE,
+	},
+	{
+		.name		= "adaptive_interval",
+		.mode		= 0644,
+		.kf_ops		= &rdtgroup_kf_single_ops,
+		.write		= rdtgroup_adaptive_interv_write,
+		.seq_show	= rdtgroup_adaptive_interv_show,
+		.fflags		= RF_CTRL_BASE,
+	},
+	{
+		.name		= "adaptive_decay",
+		.mode		= 0644,
+		.kf_ops		= &rdtgroup_kf_single_ops,
+		.write		= rdtgroup_adaptive_decay_write,
+		.seq_show	= rdtgroup_adaptive_decay_show,
+		.fflags		= RF_CTRL_BASE,
+	},
 };
 
 static int rdtgroup_add_files(struct kernfs_node *kn, unsigned long fflags)
@@ -2602,6 +2811,7 @@ static int mkdir_rdt_prepare(struct kernfs_node *parent_kn,
 	*r = rdtgrp;
 	rdtgrp->mon.parent = prdtgrp;
 	rdtgrp->type = rtype;
+	rdtgrp->act_decay = RDTGROUP_DECAY;
 	INIT_LIST_HEAD(&rdtgrp->mon.crdtgrp_list);
 
 	/* kernfs creates the directory for rdtgrp */
@@ -2704,6 +2914,371 @@ static int rdtgroup_mkdir_mon(struct kernfs_node *parent_kn,
 	return ret;
 }
 
+static int overlapped_seg(struct rdt_res_seg *a, struct rdt_res_seg *b)
+{
+	return ((a->end >= b->start) && (b->end >= a->start)) ? 1 : 0;
+}
+
+struct rdt_res_seg* find_seg(unsigned int start,
+			struct rdt_domain *domain,
+			int active)
+{
+	struct rdt_res_seg *seg = NULL, *seg_prev = NULL;
+	struct list_head	*iter_list;
+
+	if (active)
+		iter_list = &domain->act_seg_list;
+	else
+		iter_list = &domain->inact_seg_list;
+
+	list_for_each_entry(seg, iter_list, list) {
+		if (seg->start >= start)
+			break;
+		seg_prev = seg;
+	}
+
+	return seg_prev;
+}
+
+int insert_seg(struct rdt_res_seg *seg,
+		struct rdt_domain *dom, int active)
+{
+	struct rdt_res_seg *seg_pos;
+
+	seg_pos = find_seg(seg->start, dom, active);
+	if (!seg_pos) {
+		if (active)
+			list_add(&seg->list, &dom->act_seg_list);
+		else
+			list_add(&seg->list, &dom->inact_seg_list);
+	} else {
+		list_add(&seg->list, &seg_pos->list);
+	}
+	seg->dom = dom;
+
+	return 0;
+}
+
+/*
+ * Change the range of this segment, and
+ * resort the list if necessary.
+ */
+int adjust_seg(struct rdt_res_seg *seg,
+		unsigned int start,
+		unsigned int end,
+		struct rdt_domain *dom,
+		int active)
+{
+	if (seg->dom != dom)
+		return -ENODEV;
+	list_del(&seg->list);
+	seg->start = start;
+	seg->end = end;
+	insert_seg(seg, dom, active);
+
+	return 0;
+}
+
+static int group_is_adaptive(struct rdtgroup *grp)
+{
+	return grp->adaptive;
+}
+
+/*
+ * Release resource for this group.
+ */
+static int inactivate_group(struct rdtgroup *grp)
+{
+	struct rdt_res_seg *seg_prev,
+			   *seg_next,
+			   *seg;
+	struct rdt_resource *r;
+	struct rdt_domain *d;
+	u32 *dc;
+	bool mba_sc;
+
+	for_each_alloc_enabled_rdt_resource(r) {
+		mba_sc = is_mba_sc(r);
+		list_for_each_entry(d, &r->domains, list) {
+			seg = d->segs[grp->closid];
+			if (!seg)
+				continue;
+			dc = !mba_sc ? d->ctrl_val : d->mbps_val;
+			/*
+			 * FIXME:
+			 * Currently the released resource
+			 * is supposed to be merged into
+			 * adjacent resource owner.
+			 * However here we only check the
+			 * nearest resource sorted by
+			 * 'start'. It is possible that
+			 * the previous resource region with
+			 * the closed 'start' does not
+			 * have overlap with the releasing
+			 * region, but other less closer 'start'
+			 * region has overlap with the releasing
+			 * region.
+			 */
+			seg_prev = list_prev_entry(seg, list);
+			seg_next = list_next_entry(seg, list);
+			if (seg_next->start <= seg->end) {
+				pr_debug("group(%d) resource (%d,%d) becomes inactive, group(%d) resource(%d,%d)(ctrl:%x) will take it over.\n",
+						seg->closid, seg->start, seg->end,
+						seg_next->closid, seg_next->start, seg_next->end,
+						dc[seg_next->closid]);
+				/* merge to next */
+				seg_next->start = seg->start;
+				seg_next->end = seg_next->end > seg->end
+					? seg_next->end : seg->end;
+				set_ctrl_from_seg(&dc[seg_next->closid],
+								seg_next, r, RDTSEG_NOW);
+				pr_debug("group(%d) resource expands to (%d,%d), ctrl expand to (%x)\n",
+						seg_next->closid, seg_next->start,
+						seg_next->end,
+						dc[seg_next->closid]);
+			} else if (seg_prev->end >= seg->start) {
+				pr_debug("group(%d) resource (%d,%d) becomes inactive, group(%d) resource(%d,%d)(ctrl:%x) will take it over.\n",
+						seg->closid, seg->start, seg->end,
+						seg_prev->closid, seg_prev->start, seg_prev->end,
+						dc[seg_prev->closid]);
+				/* merge to previous */
+				seg_prev->end = seg_prev->end > seg->end
+					? seg_prev->end : seg->end;
+				set_ctrl_from_seg(&dc[seg_prev->closid],
+								seg_prev, r, RDTSEG_NOW);
+				pr_debug("group(%d) resource expands to (%d,%d), ctrl expand to (%x)\n",
+						seg_prev->closid, seg_prev->start,
+						seg_prev->end,
+						dc[seg_prev->closid]);
+			}
+			/* move from active to inactive list */
+			list_del(&seg->list);
+			insert_seg(seg, d, 0);
+			/* release the resource */
+			dc[grp->closid] = 0;
+		}
+	}
+	return 0;
+}
+
+static void inactive_work(struct kthread_work *work)
+{
+	struct rdtgroup *rdtgrp;
+
+	rdtgrp = container_of(work, struct rdtgroup, inactive_work);
+	mutex_lock(&rdtgroup_mutex);
+	mutex_lock(&rdtgrp->lock);
+	if (!group_is_adaptive(rdtgrp) ||
+			!(rdtgrp->flags & RDT_ACTIVE))
+		goto done;
+	if (!inactivate_group(rdtgrp))
+		rdtgrp->flags &= ~RDT_ACTIVE;
+
+ done:
+	mutex_unlock(&rdtgrp->lock);
+	mutex_unlock(&rdtgroup_mutex);
+}
+
+/*
+ * Assign resource for this group.
+ * Expected to be invoked after locked.
+ */
+static int activate_group(struct rdtgroup *grp)
+{
+	struct rdt_res_seg *seg_inact, *seg_act;
+	struct rdt_resource *r;
+	struct rdt_domain *d;
+	u32 *dc;
+	bool mba_sc;
+
+	for_each_alloc_enabled_rdt_resource(r) {
+		mba_sc = is_mba_sc(r);
+		list_for_each_entry(d, &r->domains, list) {
+			seg_inact = d->segs[grp->closid];
+			if (!seg_inact)
+				continue;
+			dc = !mba_sc ? d->ctrl_val : d->mbps_val;
+			list_for_each_entry(seg_act,
+					&d->act_seg_list, list) {
+				/* Reset all adjacent regions.*/
+				if (overlapped_seg(seg_act, seg_inact)) {
+					pr_debug("group(%d) overlapping! its resource(%d,%d) ctrl(%x) should shrink to original(%d,%d)\n",
+						seg_act->closid,
+						seg_act->start,
+						seg_act->end,
+						dc[seg_act->closid],
+						seg_act->ori_start,
+						seg_act->ori_end);
+					adjust_seg(seg_act, seg_act->ori_start,
+								seg_act->ori_end, d, 1);
+					set_ctrl_from_seg(&dc[seg_act->closid],
+								seg_act, r, RDTSEG_ORI);
+					pr_debug("group(%d) ctrl becomes (%x).\n",
+						seg_act->closid,
+						dc[seg_act->closid]);
+				}
+			}
+			adjust_seg(seg_inact, seg_inact->ori_start,
+						seg_inact->ori_end, d, 1);
+			set_ctrl_from_seg(&dc[seg_inact->closid],
+							seg_inact, r, RDTSEG_ORI);
+			pr_debug("group(%d) resource becomes (%d,%d), ctrl becomes (%x).\n",
+						seg_inact->closid,
+						seg_inact->start,
+						seg_inact->end,
+						dc[seg_inact->closid]);
+		}
+	}
+	return 0;
+}
+
+static void rdt_active_work(struct kthread_work *work)
+{
+	struct rdtgroup *rdtgrp;
+
+	/* Reducing lock granularity?
+	 * 1. resource
+	 * 2. domain
+	 * 3. seg
+	 */
+	mutex_lock(&rdtgroup_mutex);
+	rdtgrp = container_of(work, struct rdtgroup, active_work);
+	mutex_lock(&rdtgrp->lock);
+	if (!group_is_adaptive(rdtgrp) ||
+			(rdtgrp->flags & RDT_ACTIVE))
+		goto done;
+	/* Try to allocate resource for this group. */
+	if (!activate_group(rdtgrp))
+		rdtgrp->flags |= RDT_ACTIVE;
+
+ done:
+	mutex_unlock(&rdtgrp->lock);
+	mutex_unlock(&rdtgroup_mutex);
+}
+
+static void rdtgrp_irq_work(struct irq_work *irq_work)
+{
+	struct rdtgroup *rdtgrp;
+
+	rdtgrp = container_of(irq_work, struct rdtgroup, irq_work);
+
+	kthread_queue_work(&rdtgrp->worker_act, &rdtgrp->active_work);
+}
+
+/*
+ * Invoked across context switch, adjust
+ * the resource if necessary.
+ */
+void rdt_update(struct task_struct *tsk)
+{
+	struct rdtgroup *rdtgrp;
+
+	rdtgrp = tsk->grp;
+	/*
+	 * Later needs to check again because
+	 * there's no lock hold for the group.
+	 */
+	if (!rdtgrp || (!group_is_adaptive(rdtgrp)) ||
+			(rdtgrp->flags & RDT_ACTIVE))
+		return;
+
+	irq_work_queue(&rdtgrp->irq_work);
+}
+
+static int task_is_active(struct task_struct *tsk)
+{
+	return tsk->state == TASK_RUNNING ? 1 : 0;
+}
+
+static int group_is_active(struct rdtgroup *grp)
+{
+	struct task_struct *p;
+
+	list_for_each_entry(p, &grp->tasks_list, rdtgrp_list)
+		if (task_is_active(p))
+			return 1;
+	return 0;
+}
+
+static int try_to_inactivate_group(struct rdtgroup *grp)
+{
+	if (group_is_active(grp))
+		grp->act_decay = RDTGROUP_DECAY;
+	else {
+		if (!grp->act_decay)
+			kthread_queue_work(&grp->worker_inact,
+					&grp->inactive_work);
+		else
+			grp->act_decay--;
+	}
+	return 0;
+}
+
+static enum hrtimer_restart decay_timer_expired(struct hrtimer *hrtimer)
+{
+	struct rdtgroup *grp = container_of(hrtimer,
+			struct rdtgroup, decay_timer);
+
+	try_to_inactivate_group(grp);
+	hrtimer_forward_now(hrtimer, ms_to_ktime(grp->interv));
+
+	return HRTIMER_RESTART;
+}
+
+static int rdtgrp_kthread_create(struct rdtgroup *rdtgrp)
+{
+	int ret;
+	struct task_struct				*thread_act;
+	struct task_struct				*thread_inact;
+
+	/* Should we change the policy to DEADLINE? */
+	kthread_init_work(&rdtgrp->active_work, rdt_active_work);
+	kthread_init_worker(&rdtgrp->worker_act);
+	thread_act = kthread_create(kthread_worker_fn, &rdtgrp->worker_act,
+				"rdt_active:%d-%d",
+				rdtgrp->closid,
+				cpumask_first(&rdtgrp->cpu_mask));
+
+	if (IS_ERR(thread_act)) {
+		pr_err("failed to create rdtgroup active thread: %ld\n",
+				PTR_ERR(thread_act));
+		ret = PTR_ERR(thread_act);
+		return ret;
+	}
+
+	kthread_init_work(&rdtgrp->inactive_work, inactive_work);
+	kthread_init_worker(&rdtgrp->worker_inact);
+	thread_inact = kthread_create(kthread_worker_fn, &rdtgrp->worker_inact,
+				"rdt_inactive:%d-%d",
+				rdtgrp->closid,
+				cpumask_first(&rdtgrp->cpu_mask));
+
+	if (IS_ERR(thread_inact)) {
+		pr_err("failed to create rdtgroup inactive thread: %ld\n",
+				PTR_ERR(thread_inact));
+		ret = PTR_ERR(thread_inact);
+		return ret;
+	}
+
+	kthread_bind_mask(thread_act, &rdtgrp->cpu_mask);
+	kthread_bind_mask(thread_inact, &rdtgrp->cpu_mask);
+	init_irq_work(&rdtgrp->irq_work, rdtgrp_irq_work);
+
+	mutex_init(&rdtgrp->lock);
+
+	rdtgrp->thread_act = thread_act;
+	rdtgrp->thread_inact = thread_inact;
+	rdtgrp->decay = RDTGROUP_DECAY;
+	rdtgrp->interv = INACT_CHECK_INTERVAL_MS;
+	INIT_LIST_HEAD(&rdtgrp->tasks_list);
+	rdtgrp->flags |= RDT_ACTIVE;
+
+	hrtimer_init(&rdtgrp->decay_timer, CLOCK_MONOTONIC, HRTIMER_MODE_REL);
+	rdtgrp->decay_timer.function = decay_timer_expired;
+
+	return 0;
+}
+
 /*
  * These are rdtgroups created under the root directory. Can be used
  * to allocate and monitor resources.
@@ -2749,6 +3324,10 @@ static int rdtgroup_mkdir_ctrl_mon(struct kernfs_node *parent_kn,
 			goto out_del_list;
 		}
 	}
+
+	ret = rdtgrp_kthread_create(rdtgrp);
+	if (ret)
+		goto out_del_list;
 
 	goto out_unlock;
 
